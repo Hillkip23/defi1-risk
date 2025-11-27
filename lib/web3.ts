@@ -10,6 +10,9 @@ export const FINE6_ADDRESS =
 export const POOL_ADDRESS =
   "0x0Bf78f76c86153E433dAA5Ac6A88453D30968e27";
 
+// Your tokens have 0 decimals (whole tokens only)
+export const TOKEN_DECIMALS = 0;
+
 // RPC from .env.local
 const RPC_URL = process.env.NEXT_PUBLIC_RPC_URL;
 
@@ -53,7 +56,7 @@ export async function getSigner(): Promise<ethers.JsonRpcSigner> {
   return provider.getSigner();
 }
 
-// ===== Data types =====
+// ===== Types =====
 
 export type Reserves = {
   reserve0: number;
@@ -138,42 +141,65 @@ export async function analyzeLPPosition(
   };
 }
 
-// ===== Live swap function =====
+// ===== Manual approval helpers (used by UI if you want explicit approve buttons) =====
+
+export async function approveFine5Max(): Promise<void> {
+  const signer = await getSigner();
+  const token = getErc20(FINE5_ADDRESS, signer);
+
+  const tx = await token.approve(POOL_ADDRESS, ethers.MaxUint256);
+  await tx.wait();
+}
+
+export async function approveFine6Max(): Promise<void> {
+  const signer = await getSigner();
+  const token = getErc20(FINE6_ADDRESS, signer);
+
+  const tx = await token.approve(POOL_ADDRESS, ethers.MaxUint256);
+  await tx.wait();
+}
+
+// ===== Live swap function (0-decimal SAFE) =====
 
 export async function executeSwap(
   direction: SwapDirection,
   amountIn: number,
   maxSlippagePct: number
 ): Promise<SwapResult> {
-  if (amountIn <= 0) {
-    throw new Error("Amount must be greater than zero");
+  if (!Number.isFinite(amountIn) || amountIn <= 0) {
+    throw new Error("Amount must be a positive number");
   }
+  if (!Number.isInteger(amountIn)) {
+    // tokens are whole numbers only
+    amountIn = Math.floor(amountIn);
+  }
+
+  // Convert to on-chain units: since decimals = 0, just cast to BigInt
+  const amountInUnits = BigInt(amountIn);
 
   const signer = await getSigner();
   const signerAddress = await signer.getAddress();
 
   const pool = getPoolContract(signer);
-  const readOnlyPool = getPoolContract(await signer.provider!);
+  const provider = await signer.provider!;
+  const readOnlyPool = getPoolContract(provider);
 
-  // assume 18 decimals for FINE5/FINE6
-  const amountInWei = ethers.parseUnits(amountIn.toString(), 18);
-
-  // figure out which token is input
+  // Decide which token is input
   const inTokenAddress = direction === "0to1" ? FINE5_ADDRESS : FINE6_ADDRESS;
   const inToken = getErc20(inTokenAddress, signer);
 
-  // 1) ensure allowance
+  // ----- 1) Ensure allowance -----
   const currentAllowance: bigint = await inToken.allowance(
     signerAddress,
     POOL_ADDRESS
   );
 
-  if (currentAllowance < amountInWei) {
-    const approveTx = await inToken.approve(POOL_ADDRESS, amountInWei);
+  if (currentAllowance < amountInUnits) {
+    const approveTx = await inToken.approve(POOL_ADDRESS, amountInUnits);
     await approveTx.wait();
   }
 
-  // 2) compute minOut based on current reserves & slippage
+  // ----- 2) Compute minOut based on reserves & slippage -----
   const [r0, r1] = await Promise.all([
     readOnlyPool.reserve0(),
     readOnlyPool.reserve1(),
@@ -182,10 +208,14 @@ export async function executeSwap(
   const reserveIn: bigint = direction === "0to1" ? r0 : r1;
   const reserveOut: bigint = direction === "0to1" ? r1 : r0;
 
-  const feeNum = 997n;
-  const feeDen = 1000n;
+  if (reserveIn === 0n || reserveOut === 0n) {
+    throw new Error("Pool has no liquidity");
+  }
 
-  const amountInWithFee = (amountInWei * feeNum) / feeDen;
+  const FEE_NUM = 997n;
+  const FEE_DEN = 1000n;
+
+  const amountInWithFee = (amountInUnits * FEE_NUM) / FEE_DEN;
   const numerator = amountInWithFee * reserveOut;
   const denominator = reserveIn + amountInWithFee;
   const amountOut = numerator / denominator;
@@ -194,15 +224,17 @@ export async function executeSwap(
     throw new Error("Amount out is zero – check reserves and amount");
   }
 
-  const slippageBps = Math.round(maxSlippagePct * 100); // 1% => 100 bps
+  const slippageBps = Math.round(maxSlippagePct * 100); // e.g. 1% => 100 bps
   const minOut = (amountOut * BigInt(10000 - slippageBps)) / 10000n;
 
-  // 3) call the correct swap function
+  // ----- 3) Call the correct swap function -----
   let tx;
   if (direction === "0to1") {
-    tx = await pool.swapExact0For1(amountInWei, minOut);
+    // Token A (FINE5) -> Token B (FINE6)
+    tx = await pool.swapExact0For1(amountInUnits, minOut);
   } else {
-    tx = await pool.swapExact1For0(amountInWei, minOut);
+    // Token B (FINE6) -> Token A (FINE5)
+    tx = await pool.swapExact1For0(amountInUnits, minOut);
   }
 
   await tx.wait();
